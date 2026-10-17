@@ -18,7 +18,7 @@ from sqlmodel import Session, select
 
 from .. import bus, service
 from ..config import settings
-from ..models import Member, Message, Setting, Task
+from ..models import Appointment, Member, Message, Setting, Task
 from ..telemetry import messages_sent
 
 log = logging.getLogger("channels")
@@ -247,12 +247,20 @@ async def handle_callback(s: Session, member: Member, data: str) -> list[dict]:
     if kind == "dt":                                      # undo a task the agent created from conversation
         t = s.get(Task, parts[1])
         title = t.title if t else parts[1]
+        if t and not service.may_undo(s, member, task=t):
+            return [service.out(member.id, f"Only the person who asked for <b>{html.escape(title)}</b>, its owner or the lead can remove it.", "system")]
         return [service.out(member.id, f"↩️ Removed <b>{html.escape(title)}</b>.", "system")] if service.delete_task(s, parts[1]) else \
             [service.out(member.id, "That task is already gone.", "system")]
     if kind == "mc":                                      # cancel a meeting the agent scheduled from conversation
+        a = s.get(Appointment, int(parts[1]))
+        if a and not service.may_undo(s, member, appointment=a):
+            return [service.out(member.id, "Only the person who set up this meeting or the lead can cancel it.", "system")]
         return [service.out(member.id, "↩️ Meeting cancelled.", "system")] if service.cancel_appointment(s, int(parts[1])) else \
             [service.out(member.id, "That meeting is already cancelled.", "system")]
     if kind == "ul":                                      # undo a dependency the agent added
+        t = s.get(Task, parts[1])
+        if t and not service.may_undo(s, member, task=t):
+            return [service.out(member.id, "Only the task's owner, the person who asked for it or the lead can remove that dependency.", "system")]
         return [service.out(member.id, "↩️ Dependency removed.", "system")] if service.remove_dependency(s, parts[1], parts[2]) else \
             [service.out(member.id, "That dependency is already gone.", "system")]
     return []

@@ -524,3 +524,98 @@ def test_a_new_nullable_column_is_added_to_an_existing_dev_database(tmp_path, mo
     assert "member.tg_username" in added and "member.slack_dm_id" in added
     assert "tg_username" in {c["name"] for c in inspect(eng).get_columns("member")}
     assert db.add_missing_columns() == []                                                                       # idempotent
+
+
+# ================================================================ /task in plain words: the model reads it, the strict form stays exact
+
+def member_of(key):
+    with Session(db_engine) as s:
+        return s.exec(select(Member).where(Member.key == key)).first()
+
+
+def task_cmd(key, text, answer, monkeypatch):
+    seen = fake_llm(monkeypatch, answer)
+
+    async def no_extract(*a, **k):
+        return None
+    monkeypatch.setattr(llm, "extract", no_extract)
+    with Session(db_engine) as s:
+        return service.task_command(s, s.get(Member, key_id(key)), text), seen
+
+
+def said(outbox):
+    return " ".join(i["text"] for i in outbox)
+
+
+def test_a_plain_words_task_goes_to_the_named_person_with_a_clean_title(world, monkeypatch):
+    coro, seen = task_cmd("kabir", "/task priya can you get the report from meera", {"items": [
+        task_item("Get the report from Meera", "Priya", 0.6)]}, monkeypatch)
+    box = run(coro)
+    (t,) = [x for x in world.get("/api/board").json()["tasks"] if x["title"] == "Get the report from Meera"]
+    assert t["owner"] == "Priya" and "T6" in said(box)
+    assert "Design the slides (owner Aanya, Complete)" in seen[-1]          # finished work is visible to a /task too
+
+
+def test_a_status_report_typed_as_a_task_updates_the_task_instead(world, monkeypatch):
+    box = run(task_cmd("kabir", "/task done", {"items": [{"kind": "status", "task": "T2", "confidence": 0.9}]}, monkeypatch)[0])
+    with Session(db_engine) as s:
+        assert len(s.exec(select(Task)).all()) == 5                         # nothing new was created
+        assert s.get(Task, "T2").status != "Pending" or "review" in said(box).lower()
+
+
+def test_a_question_typed_as_a_task_is_answered_from_the_board(world, monkeypatch):
+    box = run(task_cmd("kabir", "/task slides hue kya", {"items": [{"kind": "question", "task": "T1", "confidence": 0.9}]}, monkeypatch)[0])
+    assert "T1" in said(box) and "Complete" in said(box) and "Aanya" in said(box)
+    with Session(db_engine) as s:
+        assert len(s.exec(select(Task)).all()) == 5
+
+
+def test_work_already_on_the_board_is_pointed_at_not_created_twice(world, monkeypatch):
+    box = run(task_cmd("kabir", "/task record the demo video", {"items": [task_item("Record the demo video", "Aanya")]}, monkeypatch)[0])
+    assert "already on the board" in said(box) and "T5" in said(box)
+
+
+def test_the_strict_form_never_asks_the_model(world, monkeypatch):
+    coro, seen = task_cmd("kabir", "/task Write the docs @priya due friday", {"items": []}, monkeypatch)
+    box = run(coro)
+    assert seen == [] and "Created" in said(box)
+
+
+def test_when_the_model_finds_nothing_the_strict_parser_still_answers(world, monkeypatch):
+    box = run(task_cmd("kabir", "/task Clean up the CSS", {"items": []}, monkeypatch)[0])
+    assert "Created" in said(box) and "Clean up the CSS" in said(box)
+
+
+def test_earlier_messages_reach_the_model_with_who_said_them(world, monkeypatch):
+    seen = fake_llm(monkeypatch, {"items": []})
+    with Session(db_engine) as s:
+        kabir, priya = s.get(Member, key_id("kabir")), s.get(Member, key_id("priya"))
+        run(service.handle_group(s, priya, "the payment page looks good"))
+        run(service.handle_group(s, kabir, "Priya please send me the staging password"))
+    assert "Priya: the payment page looks good" in seen[-1]
+
+
+# ================================================================ undo buttons are visible to everyone in a group
+
+def test_only_the_requester_the_owner_or_the_lead_may_undo_a_task(world):
+    with Session(db_engine) as s:
+        kabir, priya, meera, aanya = (s.get(Member, key_id(k)) for k in ("kabir", "priya", "meera", "aanya"))
+        t = service.create_task(s, title="Send the staging password", owner_id=priya.id, requested_by_id=kabir.id)
+        assert service.may_undo(s, kabir, task=t) and service.may_undo(s, priya, task=t) and service.may_undo(s, aanya, task=t)
+        assert not service.may_undo(s, meera, task=t)
+        box = run(channels.handle_callback(s, meera, f"dt:{t.id}"))
+        assert "Only the person" in box[0]["text"] and s.get(Task, t.id) is not None
+        run(channels.handle_callback(s, kabir, f"dt:{t.id}"))
+        assert s.get(Task, t.id) is None
+
+
+# ================================================================ Telegram: recognised by name, no /join needed
+
+def test_a_telegram_name_that_matches_one_team_member_links_them(world):
+    u = SimpleNamespace(effective_user=SimpleNamespace(id=9001, first_name="KABIR SINGH", username=None),
+                        effective_chat=SimpleNamespace(id=-1001, type="supergroup"))
+    with Session(db_engine) as s:
+        assert tg._member(s, u).key == "kabir"
+    u2 = SimpleNamespace(effective_user=SimpleNamespace(id=9002, first_name="Pat", username="pat99"), effective_chat=u.effective_chat)
+    with Session(db_engine) as s:
+        assert tg._member(s, u2) is None and s.get(Member, key_id("kabir")).tg_user_id == 9001

@@ -75,6 +75,8 @@ Meetings:
   for them. A question about a meeting ("is there a meeting?") is not an announcement.
 - Give EITHER in_minutes (for "in 20 minutes") OR start (a clock time or date resolved from NOW), never both. attendees: names only if the message
   says who must come; otherwise [] (everyone).
+- A meeting or call between team members is official too, even between just two of them ("I want to meet Bo at 9pm", "call with Ada
+  tomorrow morning"): attendees are the people named plus the speaker.
 - A request attached to the meeting ("Ada please make sure everyone is there") is ALSO a task for that person.
 
 Rules:
@@ -99,6 +101,7 @@ Examples (team: Ada, Bo):
  "Group meeting in 20 minutes, Ada please make sure everyone is there" -> {"items":[{"kind":"meeting","title":"Team meeting","in_minutes":20,"start":null,"attendees":[],"official":true,"confidence":0.95,"evidence":"Group meeting in 20 minutes"},{"kind":"task","title":"Make sure everyone attends the team meeting","owner":"Ada","due":"<today>","estimate_minutes":null,"after":[],"confidence":0.85,"evidence":"Ada please make sure everyone is there"}]}
  "stand-up tomorrow at 10am, everyone join" -> {"items":[{"kind":"meeting","title":"Stand-up","in_minutes":null,"start":"<tomorrow>T10:00","attendees":[],"official":true,"confidence":0.9,"evidence":"stand-up tomorrow at 10am"}]}
  "Bo and Ada demo with the mentor on Monday at 4pm" -> {"items":[{"kind":"meeting","title":"Demo with the mentor","in_minutes":null,"start":"<Monday>T16:00","attendees":["Bo","Ada"],"official":true,"confidence":0.9,"evidence":"demo with the mentor on Monday at 4pm"}]}
+ "I wanna meet Bo today 9 pm" (speaker Ada) -> {"items":[{"kind":"meeting","title":"Meeting with Bo","in_minutes":null,"start":"<today>T21:00","attendees":["Ada","Bo"],"official":true,"confidence":0.85,"evidence":"meet Bo today 9 pm"}]}
  "party sesh in 20 min anyone" -> {"items": []}
  "need a beer anyone up" -> {"items": []}
  "Ada send me the staging password" -> {"items":[{"kind":"task","title":"Send the staging password","owner":"Ada","due":null,"estimate_minutes":null,"after":[],"confidence":0.85,"evidence":"Ada send me the staging password"}]}
@@ -111,21 +114,35 @@ Examples (team: Ada, Bo):
 """
 
 
+COMMAND = """
+The speaker typed /task: they are explicitly asking you to put this on the plan, so return the task (or meeting) it describes even when it is
+phrased as a request, in Hindi or Hinglish, or with typos, with a clean title and the right owner ("/task tejas can you get the report from
+soham" is a task for Tejas titled "Get the report from Soham"). Two exceptions, each returned as the ONLY item:
+ {"kind":"status","task":"existing task id","confidence":0.0-1.0,"evidence":"exact words"}   it reports on existing work instead
+    ("pr is done", "login page ho gaya", "stuck on the API key")
+ {"kind":"question","task":"existing task id or null","confidence":0.0-1.0,"evidence":"exact words"}   it asks about work instead
+    ("pr hua kya", "is the login page done?")"""
+
+
 def _context(speaker: Member, members: list[Member], tasks: list[Task], today: date, recent: list[str],
-             now: datetime | None = None) -> str:
+             now: datetime | None = None, finished: bool = False) -> str:
     owner = {m.id: m.name for m in members}
     clock = (now or datetime.now().astimezone()).astimezone()
-    board = "\n".join(f"{t.id}: {t.title} (owner {owner.get(t.owner_id, '?')}, {t.status})" for t in tasks if t.status != "Complete") or "(no open tasks)"
+    shown = [t for t in tasks if finished or t.status != "Complete"]
+    board = "\n".join(f"{t.id}: {t.title} (owner {owner.get(t.owner_id, '?')}, {t.status})" for t in shown) or "(no open tasks)"
     return (f"TODAY: {today.isoformat()} ({today:%A})\nNOW: {clock:%Y-%m-%d %H:%M} (local time, {clock.tzname()})\nTEAM: {', '.join(m.name for m in members)}\nSPEAKER: {speaker.name}\n"
-            f"OPEN TASKS:\n{board}\n" + (f"EARLIER MESSAGES: {recent[-3:]}\n" if recent else ""))
+            f"{'TASKS' if finished else 'OPEN TASKS'}:\n{board}\n"
+            + ("EARLIER MESSAGES (oldest first, for context only; act on MESSAGE alone):\n" + "\n".join(recent[-6:]) + "\n" if recent else ""))
 
 
 async def ask(speaker: Member, text: str, members: list[Member], tasks: list[Task], today: date, recent: list[str] | None = None,
-              now: datetime | None = None) -> list[dict]:
-    """The raw model answer (a list of dicts). [] if there is no LLM, it fails, or it says there is nothing."""
+              now: datetime | None = None, command: bool = False) -> list[dict]:
+    """The raw model answer (a list of dicts). [] if there is no LLM, it fails, or it says there is nothing.
+    command: the speaker typed /task, so they want something on the plan (see COMMAND)."""
     if not settings.llm_enabled:
         return []
-    data = await llm.complete_json(SYSTEM, f"{_context(speaker, members, tasks, today, recent or [], now)}\nMESSAGE: {text}", max_tokens=900)
+    ctx = _context(speaker, members, tasks, today, recent or [], now, finished=command)
+    data = await llm.complete_json(SYSTEM + (COMMAND if command else ""), f"{ctx}\nMESSAGE: {text}", max_tokens=900)
     items = (data or {}).get("items") if isinstance(data, dict) else None
     return [i for i in items if isinstance(i, dict)] if isinstance(items, list) else []
 
@@ -169,16 +186,21 @@ def grounded(text: str, task: Task) -> bool:
     return bool(words & _norm(text)) if words else True
 
 
-def is_duplicate(title: str, tasks: list[Task]) -> bool:
-    """The same work is already on the board (open, or finished): do not create it twice."""
+def find_duplicate(title: str, tasks: list[Task]) -> Task | None:
+    """The task already on the board (open, or finished) that is the same work as `title`, if any."""
     mine = _norm(title)
     if not mine:
-        return False
+        return None
     for t in tasks:
         theirs = _norm(t.title)
         if theirs and len(mine & theirs) / min(len(mine), len(theirs)) >= 0.75 and len(mine & theirs) >= 2:
-            return True
-    return False
+            return t
+    return None
+
+
+def is_duplicate(title: str, tasks: list[Task]) -> bool:
+    """The same work is already on the board (open, or finished): do not create it twice."""
+    return find_duplicate(title, tasks) is not None
 
 
 def _meeting_start(raw: dict, now: datetime) -> datetime | None:
@@ -329,6 +351,41 @@ async def handle(s: Session, speaker: Member, text: str, today: date | None = No
     if not proposals:
         return [], []
     return apply(s, speaker, proposals)
+
+
+COMMAND_MIN_CONFIDENCE = 0.4          # /task is an explicit request: a lower bar than overhearing a conversation
+
+
+@dataclass
+class Command:
+    """What a /task in plain words turned out to be."""
+    kind: str                                   # "plan" (tasks/meetings written) | "status" | "question" | "duplicate" | "nothing"
+    lines: list[str] = field(default_factory=list)
+    buttons: list[list[tuple[str, str]]] = field(default_factory=list)
+    task: Task | None = None                    # status / question / duplicate: the existing task it is about
+
+
+async def handle_command(s: Session, speaker: Member, text: str, today: date | None = None, recent: list[str] | None = None) -> Command:
+    """/task <plain words>: the model reads it like any message, knowing the speaker wants it on the plan."""
+    today = today or date.today()
+    members = list(s.exec(select(Member)).all())
+    tasks = list(s.exec(select(Task)).all())
+    from .models import Appointment
+    now = datetime.now(timezone.utc)
+    items = await ask(speaker, text, members, tasks, today, recent, now, command=True)
+    by_id = {t.id: t for t in tasks}
+    for raw in items:
+        if raw.get("kind") in ("status", "question"):
+            return Command(raw["kind"], task=by_id.get(str(raw.get("task") or "").strip().upper()))
+    upcoming = list(s.exec(select(Appointment).where(Appointment.status == "scheduled")).all())
+    proposals = validate(items, speaker, members, tasks, today, min_confidence=COMMAND_MIN_CONFIDENCE, text=text, now=now,
+                         appointments=upcoming)
+    if proposals:
+        lines, buttons = apply(s, speaker, proposals)
+        if lines:
+            return Command("plan", lines, buttons)
+    dup = next((d for i in items if i.get("kind") == "task" and (d := find_duplicate(str(i.get("title", "")), tasks))), None)
+    return Command("duplicate", task=dup) if dup else Command("nothing")
 
 
 SYSTEM_DEPS = """You are given the open tasks of a team project. Propose the dependencies that are OBVIOUS from their titles: pairs where one task

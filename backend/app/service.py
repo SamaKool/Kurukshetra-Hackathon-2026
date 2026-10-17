@@ -257,6 +257,62 @@ def handle_task_command(s: Session, member: Member, text: str, today: date | Non
     return reply, notes
 
 
+# the strict form: an @owner, a due/est keyword or a prerequisite id. Written like that, /task is parsed exactly as typed.
+_STRICT = re.compile(r"@\w|\b(?:due|est)\s+\S|\b(?:after|depends\s+on)\s+T\d+\b", re.I)
+
+
+def recent_group(s: Session, limit: int = 6) -> list[str]:
+    """The last group messages as "Name: text", oldest first, so the model knows who said what."""
+    rows = s.exec(select(Message).where(Message.kind == "group").order_by(Message.id.desc()).limit(limit)).all()
+    names = {m.id: m.name for m in s.exec(select(Member)).all()}
+    return [f"{names.get(r.member_id, 'someone')}: {r.text}" for r in reversed(rows)]
+
+
+async def task_command(s: Session, member: Member, text: str, channel: str = "telegram", ext_id: str | None = None,
+                       today: date | None = None) -> list[dict]:
+    """/task (or "task: ...") in any app. In the strict form it is parsed exactly; in plain words the LLM reads it like any message,
+    so "/task tejas can you get the report from soham" is Tejas's task, "/task pr is done" is a status report and "/task pr hua kya"
+    is a question. Without an LLM, or when the model finds nothing it can use, the strict parser answers (and explains itself)."""
+    from .taskparse import PREFIX
+    body = PREFIX.sub("", text or "", count=1).strip()
+    if settings.llm_enabled and len(body) >= 3 and not _STRICT.search(body):
+        c = await converse.handle_command(s, member, body, today, recent=recent_group(s))
+        t = c.task
+        if c.kind == "plan":
+            return [out(member.id, "\n".join(c.lines), "confirm", None, c.buttons)]
+        if c.kind == "status" and t:
+            msg = record_in(s, member, body, t.id, channel=channel, ext_id=ext_id)
+            if t.owner_id == member.id:
+                return await decide_and_act(s, member, t, body, msg)
+            owner = s.get(Member, t.owner_id)
+            return await check_conflict(s, member, t, body, msg) or [
+                out(member.id, f"<b>{t.id} · {escape(t.title)}</b> belongs to {escape(owner.name)}, so only they can update it. "
+                               f"It is <b>{t.status}</b> right now.", "system", t.id)]
+        if c.kind in ("status", "question"):
+            if t is None:
+                return [out(member.id, "I could not tell which task you mean. Name it or use its id, like T3.", "system")]
+            owner = s.get(Member, t.owner_id)
+            extra = f" ⛔ {escape(t.blocker_text)}" if t.status == "Blocked" and t.blocker_text else ""
+            return [out(member.id, f"{STATUS_EMOJI.get(t.status, '')} <b>{t.id} · {escape(t.title)}</b> is <b>{t.status}</b> "
+                                   f"(owner {escape(owner.name)}).{extra}", "system", t.id)]
+        if c.kind == "duplicate" and t:
+            return [out(member.id, f"That is already on the board: <b>{t.id} · {escape(t.title)}</b> "
+                                   f"(owner {escape(s.get(Member, t.owner_id).name)}, {t.status}).", "system", t.id)]
+    reply, notes = handle_task_command(s, member, text, today)
+    return [out(member.id, reply, "confirm")] + notes
+
+
+def may_undo(s: Session, member: Member, *, task: Task | None = None, appointment: Appointment | None = None) -> bool:
+    """An undo button is visible to the whole group, so only the person who asked for the change, the owner or the lead may tap it."""
+    if member.role == "lead":
+        return True
+    if task is not None:
+        return member.id in (task.owner_id, task.requested_by_id) or task.requested_by_id is None
+    if appointment is not None:
+        return appointment.created_by_id in (None, member.id)
+    return True
+
+
 # ---------------------------------------------------------------- recording
 
 def record_in(s, member, text, task_id=None, kind="reply", channel="telegram", ext_id=None, reply_to=None) -> Message:
@@ -395,8 +451,7 @@ def send_to_review(s, task, decision: Decision, member: Member, msg: Message | N
 async def handle_dm(s: Session, member: Member, text: str, *, reply_to: str | None = None,
                     ext_id: str | None = None, channel: str = "telegram", task_hint: str | None = None) -> list[dict]:
     if not member.awaiting_blocker_task and is_task_command(text):          # "task: ..." creates a task
-        reply, notes = handle_task_command(s, member, text)
-        return [out(member.id, reply, "confirm")] + notes
+        return await task_command(s, member, text, channel=channel, ext_id=ext_id)
 
     if not member.awaiting_blocker_task:                                    # an answer to one of the agent's own requests?
         from .intel import responses
@@ -490,8 +545,7 @@ async def handle_group(s: Session, member: Member, text: str, ext_id=None, chann
                        reply_to: str | None = None) -> list[dict]:
     """Group chat: catch teammates who believe something different from the board."""
     if is_task_command(text):                          # "task: ..." in the group creates a task
-        reply, notes = handle_task_command(s, member, text)
-        return [out(member.id, reply, "confirm")] + notes
+        return await task_command(s, member, text, channel=channel, ext_id=ext_id)
     from .intel import responses  # an answer to one of the agent's own messages?
     answered = await responses.try_handle(s, member, text, reply_to=reply_to, ext_id=ext_id, channel=channel)
     if answered is not None:
@@ -503,7 +557,7 @@ async def handle_group(s: Session, member: Member, text: str, ext_id=None, chann
         msg = record_in(s, member, text, t.id, kind="group", channel=channel, ext_id=ext_id)
         return await check_conflict(s, member, t, clause, msg)
     task = match_task(s, text, all_tasks)
-    recent = [m.text for m in s.exec(select(Message).where(Message.kind == "group").order_by(Message.id.desc()).limit(4)).all()[1:]][::-1]
+    recent = recent_group(s)
     msg = record_in(s, member, text, task.id if task else None, kind="group", channel=channel, ext_id=ext_id)
     own_open = [t for t in all_tasks if t.owner_id == member.id and t.status != "Complete"]
     status_like = bool(DONE.search(text) or BLOCK.search(text) or PROGRESS.search(text))
