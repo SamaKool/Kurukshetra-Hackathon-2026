@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Forecast, GraphData, Status } from '../api'
 import { ForecastPage } from './Forecast'
-import { humanMinutes, layers } from './forecastUtil'
+import { humanMinutes, sequence } from './forecastUtil'
 
 afterEach(() => {
   cleanup()
@@ -58,13 +58,17 @@ describe('helpers', () => {
     expect(humanMinutes(125)).toBe('2h 5m')
     expect(humanMinutes(-30)).toBe('30 min')
   })
-  it('layers puts a task one column right of its deepest prerequisite', () => {
-    const d = layers(graph)
-    expect(d).toEqual({ T3: 0, T2: 1, T4: 2 })
+  it('sequence puts every prerequisite before the task that waits for it', () => {
+    expect(sequence(graph)).toEqual({ T3: 0, T2: 1, T4: 2 })
   })
-  it('layers survives a dependency cycle', () => {
+  it('sequence lays independent tasks out one after the other in creation order, not stacked in one column', () => {
+    const node = graph.nodes[0]
+    const free: GraphData = { nodes: ['T10', 'T2', 'T1', 'T3'].map((id) => ({ ...node, id })), edges: [] }
+    expect(sequence(free)).toEqual({ T1: 0, T2: 1, T3: 2, T10: 3 })
+  })
+  it('sequence survives a dependency cycle and still gives every task its own column', () => {
     const cyc: GraphData = { nodes: graph.nodes.slice(0, 2), edges: [{ source: 'T3', target: 'T2' }, { source: 'T2', target: 'T3' }] }
-    expect(() => layers(cyc)).not.toThrow()
+    expect(Object.values(sequence(cyc)).sort()).toEqual([0, 1])
   })
 })
 

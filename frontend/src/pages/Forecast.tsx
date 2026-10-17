@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import type { AgentActionRow, Forecast, GraphData, RiskEvent, Status } from '../api'
 import { api } from '../api'
 import { Callout, Empty, fmtTime, PageHeader, plain, StatusTag, Tag } from '../ui'
-import { humanMinutes, layers } from './forecastUtil'
+import { humanMinutes, sequence } from './forecastUtil'
 import { Timeline } from '../components/Timeline'
 
 const SEVERITY_COLOR = { HIGH: 'red', MEDIUM: 'orange', LOW: 'gray' } as const
@@ -17,19 +17,19 @@ const ACTION_STATUS_COLOR = { pending: 'gray', sent: 'blue', committed: 'yellow'
 const STATUS_FILL: Record<Status, string> = { Pending: 'var(--c-gray)', 'In Progress': 'var(--blue-bg)', Blocked: 'var(--red-bg)', Complete: 'var(--green-bg)' }
 
 function DependencyGraph({ graph }: { graph: GraphData }) {
-  const depth = layers(graph)
-  const cols = Math.max(0, ...Object.values(depth)) + 1
-  const rowOf: Record<string, number> = {}
-  const used: Record<number, number> = {}
-  graph.nodes.forEach((n) => { rowOf[n.id] = used[depth[n.id]] = (used[depth[n.id]] ?? -1) + 1 })
-  const W = 170, H = 54, GX = 54, GY = 18
-  const rows = Math.max(1, ...Object.values(used).map((v) => v + 1))
-  const pos = (id: string) => ({ x: 8 + depth[id] * (W + GX), y: 8 + rowOf[id] * (H + GY) })
+  const col = sequence(graph)
+  const cols = Math.max(1, graph.nodes.length)
+  const W = 170, H = 54, GX = 54
+  // a link that skips over tasks arcs above the row instead of running through their boxes
+  const span = (e: { source: string; target: string }) => Math.abs((col[e.target] ?? 0) - (col[e.source] ?? 0))
+  const lift = (n: number) => Math.min(90, 20 + n * 14)
+  const top = 8 + Math.max(0, ...graph.edges.filter((e) => span(e) > 1).map((e) => lift(span(e))))
+  const pos = (id: string) => ({ x: 8 + (col[id] ?? 0) * (W + GX), y: top })
   const width = 16 + cols * W + (cols - 1) * GX
-  const height = 16 + rows * H + (rows - 1) * GY
+  const height = top + H + 8
   return (
     <div className="table-wrap" role="img" aria-label="Task dependency graph">
-      <svg viewBox={`0 0 ${width} ${height}`} width="100%" style={{ display: 'block', maxWidth: width, height: 'auto' }}>
+      <svg viewBox={`0 0 ${width} ${height}`} width={width} height={height} style={{ display: 'block' }}>
         <defs>
           <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
             <path d="M0,0 L8,4 L0,8 z" fill="currentColor" opacity="0.5" />
@@ -37,7 +37,10 @@ function DependencyGraph({ graph }: { graph: GraphData }) {
         </defs>
         {graph.edges.map((e, i) => {
           const a = pos(e.source), b = pos(e.target)
-          return <path key={i} d={`M${a.x + W},${a.y + H / 2} C${a.x + W + GX / 2},${a.y + H / 2} ${b.x - GX / 2},${b.y + H / 2} ${b.x},${b.y + H / 2}`}
+          const d = span(e) === 1 && a.x < b.x
+            ? `M${a.x + W},${a.y + H / 2} L${b.x},${b.y + H / 2}`
+            : `M${a.x + W / 2},${a.y} C${a.x + W / 2},${a.y - lift(span(e))} ${b.x + W / 2},${b.y - lift(span(e))} ${b.x + W / 2},${b.y}`
+          return <path key={i} d={d} data-edge={`${e.source}-${e.target}`}
             fill="none" stroke="currentColor" opacity="0.4" strokeWidth="1.5" markerEnd="url(#arrow)" />
         })}
         {graph.nodes.map((n) => {
