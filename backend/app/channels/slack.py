@@ -176,9 +176,10 @@ def _register(app) -> None:
                 return
             text = re.sub(r"<@[A-Z0-9]+>", "", text).strip()
             if not is_dm and is_task_command(text) and (not settings.slack_project_channel or ch == settings.slack_project_channel):
-                reply, notes = service.handle_task_command(s, me, text)         # answer in the channel thread
-                await say(text=channels.to_slack(reply), thread_ts=event.get("ts"))
-                await channels.deliver(s, notes)
+                outbox = await service.task_command(s, me, text, channel="slack", ext_id=event.get("ts"))
+                for item in [i for i in outbox if i["member_id"] == me.id]:          # answer in the channel thread
+                    await say(text=channels.to_slack(item["text"]), blocks=blocks_for(item), thread_ts=event.get("ts"))
+                await channels.deliver(s, [i for i in outbox if i["member_id"] != me.id])
                 return
             if is_dm:
                 outbox = await service.handle_dm(s, me, text, reply_to=event.get("thread_ts"), ext_id=event.get("ts"),
@@ -226,9 +227,10 @@ def _register(app) -> None:
                 if not me:
                     await respond("I do not know who you are yet: send me a direct message once so I can match your email.")
                     return
-                reply, notes = service.handle_task_command(s, me, "task: " + (command.get("text") or "").strip()[4:])
-                await respond(channels.to_slack(reply))
-                await channels.deliver(s, notes)
+                outbox = await service.task_command(s, me, "task: " + (command.get("text") or "").strip()[4:], channel="slack")
+                for item in [i for i in outbox if i["member_id"] == me.id]:
+                    await respond(channels.to_slack(item["text"]))
+                await channels.deliver(s, [i for i in outbox if i["member_id"] != me.id])
                 return
             if sub == "checkin":
                 me = await _resolve_member(s, client, command["user_id"], None)

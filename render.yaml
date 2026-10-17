@@ -17,6 +17,8 @@ services:
         value: prod
       - key: MIGRATE_ON_START
         value: "true"
+      - key: TZ                     # the team's clock: "9 pm" and "today" in chat mean India time, not the server's UTC
+        value: IST-5:30
       - key: DATABASE_URL           # Postgres from Render or Neon; without it, SQLite is wiped on every deploy
         sync: false
       - key: FRONTEND_ORIGIN        # the Vercel URL, for CORS

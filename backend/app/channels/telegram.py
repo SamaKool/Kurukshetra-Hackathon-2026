@@ -114,6 +114,8 @@ channels.register(CHANNEL)
 
 def _member(s: Session, update: Update) -> Member | None:
     m = s.exec(select(Member).where(Member.tg_user_id == update.effective_user.id)).first()
+    if m is None:
+        m = _recognise(s, update)
     uname = getattr(update.effective_user, "username", None)
     if m is not None and uname and m.tg_username != uname:       # learn (and keep current) the @username people are tagged by
         m.tg_username = uname
@@ -122,10 +124,27 @@ def _member(s: Session, update: Update) -> Member | None:
     return m
 
 
-def resolve_mentions(s: Session, text: str, bot_username: str | None = None) -> str:
+def _recognise(s: Session, update: Update) -> Member | None:
+    """Someone who never sent /join, but whose Telegram name is exactly one not-yet-connected team member's name
+    ("TEJAS NALAWADE" -> Tejas): link them, so nobody has to type a command before the bot listens."""
+    user = update.effective_user
+    first = (getattr(user, "first_name", None) or "").strip().lower()
+    words = {first, *first.split()[:1], (getattr(user, "username", None) or "").lower()} - {""}
+    free = [x for x in s.exec(select(Member)).all() if not x.tg_user_id]
+    hits = [x for x in free if x.name.lower() in words or x.key.lower() in words]
+    if len(hits) != 1:
+        return None
+    _link(s, hits[0], update)
+    log.info("recognised Telegram user %s as %s", user.id, hits[0].name)
+    return hits[0]
+
+
+def resolve_mentions(s: Session, text: str, bot_username: str | None = None, as_handle: bool = False) -> str:
     """"@JustSoham the deployment is stopped" -> "Soham the deployment is stopped": team members tagged by their Telegram
-    @username become their team name (so the rest of the pipeline sees who is meant); the bot's own @tag is dropped."""
-    names = {(m.tg_username or "").lower(): m.name for m in s.exec(select(Member)).all() if m.tg_username}
+    @username become their team name (so the rest of the pipeline sees who is meant); the bot's own @tag is dropped.
+    as_handle: "@soham" instead, for the strict /task form, where @ marks the owner."""
+    names = {(m.tg_username or "").lower(): ("@" + m.key if as_handle else m.name)
+             for m in s.exec(select(Member)).all() if m.tg_username}
 
     def sub(m):
         u = m.group(1).lower()
@@ -268,7 +287,7 @@ async def on_bot_added(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sees_all = cm.new_chat_member.status == "administrator" or bool(me.can_read_all_group_messages)
     lines = ["👋 <b>Project coordinator</b> here. I keep track of tasks, blockers and deadlines for this team, right in this chat.", "",
              "1. Everyone tap your name below (or send /join) so I know who is who.",
-             "2. Add a task: <code>/task Build the login page @name due friday est 3h</code>",
+             "2. Just say it: “Soham please fix the login page by Friday”. No command needed; <code>/task</code> works too.",
              "3. Tell me what is blocking you in plain words and I'll find who can help."]
     if not sees_all:
         lines += ["", "⚠️ Right now I only see /commands, @mentions and replies to my messages. Make me an <b>admin</b> of this group "
@@ -306,9 +325,21 @@ async def task_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if me is None:
             await update.message.reply_text("Send /join first so I know who you are.")
             return
-        reply, notes = service.handle_task_command(s, me, update.message.text)
-        await update.message.reply_html(reply)
-        await channels.deliver(s, notes)
+        group = update.effective_chat.type != ChatType.PRIVATE
+        if group:
+            _remember_group(s, update.effective_chat)
+            if ctx is not None:
+                asyncio.create_task(_typing(ctx, update.effective_chat.id))
+        text = resolve_mentions(s, update.message.text, getattr(getattr(ctx, "bot", None), "username", None), as_handle=True)
+        mid = getattr(update.message, "message_id", None)
+        outbox = await service.task_command(s, me, text, ext_id=str(mid) if mid else None)
+        people = {x.id: x for x in s.exec(select(Member)).all()}
+        for item in [i for i in outbox if i["member_id"] == me.id]:          # answered right where it was asked
+            markup = (InlineKeyboardMarkup([[InlineKeyboardButton(lbl, callback_data=d) for lbl, d in row] for row in item["buttons"]])
+                      if item["buttons"] else None)
+            await update.message.reply_html(channels.expand_mentions(item["text"], people, "telegram" if group else "html"),
+                                            **({"reply_markup": markup} if markup else {}))
+        await channels.deliver(s, [i for i in outbox if i["member_id"] != me.id])
 
 
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
